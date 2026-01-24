@@ -1,6 +1,11 @@
 package structs
 
-import "time"
+import (
+	"sync"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
 
 type ScrappedInfo struct {
 	ID            int       `json:"id"`
@@ -44,17 +49,35 @@ type ScrapedData struct {
 	Error   string   `json:"error,omitempty"`
 }
 
+type CarouselPhotos struct {
+	Thumbnail []string `json:"thumbnail,omitempty"`
+	Full      []string `json:"full,omitempty"`
+}
+
 type Selectors struct {
-	Photos  []string `json:"photos,omitempty"`
-	Content []string `json:"content,omitempty"`
+	Ref            string         `json:"ref,omitempty"`
+	Photos         []string       `json:"photos,omitempty"`
+	Content        []string       `json:"content,omitempty"`
+	CarouselPhotos CarouselPhotos `json:"carousel_photos"`
 }
 
 type ScrapeRequest struct {
+	Name      string    `json:"name"`
 	URLs      []string  `json:"urls"`
-	Selectors Selectors `json:"selectors,omitempty"`
+	Selectors Selectors `json:"selectors"`
 }
 
 type ScrapeResponse struct {
 	Results []ScrapedData `json:"results"`
 	Total   int           `json:"total"`
+}
+
+type WorkerInput struct {
+	Name       string
+	WorkerId   int
+	Browser    playwright.Browser
+	UrlChan    <-chan string
+	ResultChan chan<- ScrapedData
+	Wg         *sync.WaitGroup
+	Selectors  Selectors
 }

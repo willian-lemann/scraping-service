@@ -5,10 +5,10 @@ import (
 	"fiber/config"
 	"fiber/database"
 	"fiber/structs"
+	"fiber/worker"
+	"fmt"
 	"log"
 	"os"
-	"regexp"
-	"strings"
 	"sync"
 	"time"
 
@@ -29,79 +29,16 @@ func getPort() string {
 }
 
 var DESCRIPTION_SELECTORS = []string{}
-
 var PHOTO_SELECTORS = []string{}
+var CAROUSEL_SELECTORS = structs.CarouselPhotos{}
+var REF_SELECTOR string
+var NAME string
 
 var dbPool *pgxpool.Pool
 
-func extractFromURLRef(url string) string {
-	re := regexp.MustCompile(`/imovel/venda/(\d+)/`)
-	matches := re.FindStringSubmatch(url)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-
-	return ""
-}
-
-func scrapeURL(page playwright.Page, url string) structs.ScrapedData {
-	result := structs.ScrapedData{
-		URL:     url,
-		Ref:     extractFromURLRef(url),
-		Photos:  []string{},
-		Content: "",
-	}
-
-	// Navigate to URL
-	if _, err := page.Goto(url, playwright.PageGotoOptions{
-		WaitUntil: playwright.WaitUntilStateNetworkidle,
-		Timeout:   playwright.Float(10000),
-	}); err != nil {
-		result.Error = "Failed to navigate: " + err.Error()
-		return result
-	}
-
-	for _, selector := range DESCRIPTION_SELECTORS {
-		locator := page.Locator(selector).First()
-		text, err := locator.InnerText(playwright.LocatorInnerTextOptions{
-			Timeout: playwright.Float(3000),
-		})
-		if err == nil && strings.TrimSpace(text) != "" {
-			result.Content = strings.TrimSpace(text)
-			break
-		}
-	}
-
-	for _, selector := range PHOTO_SELECTORS {
-		imgs := page.Locator(selector)
-		count, err := imgs.Count()
-		if err != nil {
-			continue
-		}
-
-		for i := 0; i < count; i++ {
-			img := imgs.Nth(i)
-			src, err := img.GetAttribute("src")
-			if err == nil && src != "" && strings.Contains(src, "http") {
-				result.Photos = append(result.Photos, src)
-			}
-		}
-
-		if len(result.Photos) > 0 {
-			break
-		}
-	}
-
-	return result
-}
-
-// single-job coordination: block all requests while a job runs
-var jobLock sync.RWMutex
-var jobFlagMutex sync.Mutex
-var jobRunning bool
-
 func scrapeHandler(c *fiber.Ctx) error {
 	var req structs.ScrapeRequest
+
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid request body",
@@ -114,24 +51,6 @@ func scrapeHandler(c *fiber.Ctx) error {
 		})
 	}
 
-	if len(req.Selectors.Content) == 0 && len(req.Selectors.Photos) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "No URLs provided",
-		})
-	}
-
-	// ensure only one job can start
-	jobFlagMutex.Lock()
-	if jobRunning {
-		jobFlagMutex.Unlock()
-		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-			"error": "Another job is running",
-		})
-	}
-	jobRunning = true
-	jobFlagMutex.Unlock()
-
-	// set selectors up-front (safe because only one job at a time)
 	if len(req.Selectors.Photos) > 0 {
 		PHOTO_SELECTORS = req.Selectors.Photos
 	}
@@ -139,17 +58,14 @@ func scrapeHandler(c *fiber.Ctx) error {
 		DESCRIPTION_SELECTORS = req.Selectors.Content
 	}
 
-	// run the full scraping job in background and immediately return
-	go func(r structs.ScrapeRequest) {
-		// acquire write lock so all other requests block until the job finishes
-		jobLock.Lock()
-		defer func() {
-			jobLock.Unlock()
-			jobFlagMutex.Lock()
-			jobRunning = false
-			jobFlagMutex.Unlock()
-		}()
+	if len(req.Selectors.CarouselPhotos.Full) > 0 || len(req.Selectors.CarouselPhotos.Thumbnail) > 0 {
+		CAROUSEL_SELECTORS = req.Selectors.CarouselPhotos
+	}
 
+	NAME = req.Name
+	REF_SELECTOR = req.Selectors.Ref
+
+	go func(r structs.ScrapeRequest) {
 		pw, err := playwright.Run()
 		if err != nil {
 			log.Printf("Background job: Failed to start playwright: %v", err)
@@ -166,8 +82,9 @@ func scrapeHandler(c *fiber.Ctx) error {
 		}
 		defer browser.Close()
 
+		start := time.Now()
 		numWorkers := 10
-		log.Printf("Background job: starting %d workers", numWorkers)
+		log.Printf("Background job for %s", NAME)
 
 		urlChan := make(chan string, len(r.URLs))
 		resultChan := make(chan structs.ScrapedData, len(r.URLs))
@@ -177,28 +94,20 @@ func scrapeHandler(c *fiber.Ctx) error {
 
 		for i := range numWorkers {
 			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-
-				context, err := browser.NewContext()
-				if err != nil {
-					log.Printf("Worker %d: Failed to create context: %v", workerID, err)
-					return
-				}
-				defer context.Close()
-
-				page, err := context.NewPage()
-				if err != nil {
-					log.Printf("Worker %d: Failed to create page: %v", workerID, err)
-					return
-				}
-
-				for url := range urlChan {
-					result := scrapeURL(page, url)
-					resultChan <- result
-					time.Sleep(100 * time.Millisecond)
-				}
-			}(i)
+			go worker.Worker(structs.WorkerInput{
+				Name:       NAME,
+				Wg:         &wg,
+				WorkerId:   i,
+				Browser:    browser,
+				UrlChan:    urlChan,
+				ResultChan: resultChan,
+				Selectors: structs.Selectors{
+					Content:        DESCRIPTION_SELECTORS,
+					Photos:         PHOTO_SELECTORS,
+					CarouselPhotos: CAROUSEL_SELECTORS,
+					Ref:            REF_SELECTOR,
+				},
+			})
 		}
 
 		go func() {
@@ -220,6 +129,7 @@ func scrapeHandler(c *fiber.Ctx) error {
 		errorCount := 0
 
 		for result := range resultChan {
+
 			results = append(results, result)
 
 			if result.Error == "" {
@@ -254,28 +164,20 @@ func scrapeHandler(c *fiber.Ctx) error {
 
 			for i := range numRetryWorkers {
 				retryWg.Add(1)
-				go func(workerID int) {
-					defer retryWg.Done()
-
-					context, err := browser.NewContext()
-					if err != nil {
-						log.Printf("Retry Worker %d: Failed to create context: %v", workerID, err)
-						return
-					}
-					defer context.Close()
-
-					page, err := context.NewPage()
-					if err != nil {
-						log.Printf("Retry Worker %d: Failed to create page: %v", workerID, err)
-						return
-					}
-
-					for url := range retryUrlChan {
-						result := scrapeURL(page, url)
-						retryResultChan <- result
-						time.Sleep(200 * time.Millisecond)
-					}
-				}(i)
+				go worker.Worker(structs.WorkerInput{
+					Name:       fmt.Sprintf("Retry %s", NAME),
+					Wg:         &retryWg,
+					WorkerId:   i,
+					Browser:    browser,
+					UrlChan:    retryUrlChan,
+					ResultChan: retryResultChan,
+					Selectors: structs.Selectors{
+						Content:        DESCRIPTION_SELECTORS,
+						Photos:         PHOTO_SELECTORS,
+						CarouselPhotos: CAROUSEL_SELECTORS,
+						Ref:            REF_SELECTOR,
+					},
+				})
 			}
 
 			// Send retry URLs
@@ -312,7 +214,6 @@ func scrapeHandler(c *fiber.Ctx) error {
 				}
 			}
 
-			// Update database with final failed links after retry
 			if len(retryFailedLinks) > 0 {
 				ctx := context.Background()
 				err := database.UpdateScrappedInfo(dbPool, ctx, structs.ScrappedInfo{LinksFailed: retryFailedLinks})
@@ -322,7 +223,8 @@ func scrapeHandler(c *fiber.Ctx) error {
 			}
 		}
 
-		log.Printf("Background job finished: processed %d results, saved %d, errors %d", len(results), savedCount, errorCount)
+		elapsed := time.Since(start)
+		log.Printf("Background job finished: processed %d results, saved %d, errors %d, elapsed time %s", len(results), savedCount, errorCount, elapsed.Round(elapsed))
 	}(req)
 
 	// respond immediately to free the HTTP connection
@@ -349,13 +251,6 @@ func main() {
 		return c.JSON(fiber.Map{
 			"ok": "true",
 		})
-	})
-
-	// middleware to block requests while a job holds the write lock
-	app.Use(func(c *fiber.Ctx) error {
-		jobLock.RLock()
-		defer jobLock.RUnlock()
-		return c.Next()
 	})
 
 	app.Post("/scrape", scrapeHandler)

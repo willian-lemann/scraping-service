@@ -16,8 +16,6 @@ func InitDB() (dbPool *pgxpool.Pool, err error) {
 	password := os.Getenv("DB_PASSWORD")
 	database := os.Getenv("DB_DATABASE")
 
-	fmt.Println(database, password)
-
 	connString := fmt.Sprintf(
 		"postgres://%s:%s@%s:%s/%s",
 		user, password, host, port, database,

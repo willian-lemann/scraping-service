@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fiber/structs"
 	"fmt"
 
@@ -17,17 +18,18 @@ func UpdateListing(conn *pgxpool.Pool, ctx context.Context, id string, data stru
 		WHERE ref = $3
 	`
 
-	res, err := conn.Exec(ctx, query,
+	photosJSON, err := json.Marshal(data.Photos)
+	if err != nil {
+		return fmt.Errorf("failed to marshal photos: %w", err)
+	}
+
+	_, err = conn.Exec(ctx, query,
 		data.Content,
-		data.Photos,
+		photosJSON,
 		id,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update listing: %w", err)
-	}
-
-	if res.RowsAffected() == 0 {
-		return fmt.Errorf("no listing found with ref %s", data.Ref)
 	}
 
 	UpdateScrappedInfo(conn, ctx, structs.ScrappedInfo{LinksFailed: []string{""}})
